@@ -1,0 +1,41 @@
+---
+name: git-absorb-commit
+description: Absorb a cleanup or fixup HEAD commit into preceding owner commits while preserving the final tree. Supports modified text hunks and newly added text files, including requests that name the destination commits or permit unassigned changes to remain in a final residual commit.
+---
+
+# Absorb a commit into its earlier owners
+
+Preserve the final file tree exactly. Respect the user's named destination commits. Otherwise attribute modified lines by history, not simply the most recent commit touching each file. Different hunks in one file can belong to different commits; newly added files need an explicit ownership decision because they have no blame history.
+
+Use the bundled Python 3 script for planning and rewriting. It uses a temporary index, preserves commit messages and author/committer metadata, keeps a backup ref, and updates the current branch only after verifying the final tree. No checkout, reset, stash, push, or live worktree edit is needed.
+
+## Workflow
+
+1. Read applicable repository instructions. Inspect `git status --short`, branch, target diff, and the branch base. Use the repository's default branch, not an assumed `main`. Resolve the boundary with `git merge-base HEAD <base-ref>`.
+2. The script supports a nonempty **HEAD commit**, added or modified UTF-8 regular text files, and linear history since the boundary. Text must end with a newline unless empty. It rejects dirty worktrees, merges, deletions/renames, mode changes to existing files, and signed commits that would need rewriting. If unsupported, explain the limitation; do not reset, drop changes, or broaden the rewrite automatically. Ask only for genuinely missing scope or a necessary alternative.
+3. Generate a plan outside the repository:
+
+   ```bash
+   python3 /absolute/skill/path/scripts/absorb.py plan --repo /absolute/repo --commit <sha> --base <merge-base-sha> --out /tmp/absorb-plan.json
+   ```
+
+4. Read the JSON plan and review every assignment:
+
+   - `change: "modify"` hunks show old/new lines and blame candidates, with counts and commit subjects. A sole eligible owner is filled automatically. For a hunk spanning several commits, inspect `git show <candidate> -- <file>` and choose the commit that introduced the construct being corrected. Formatting of a combined construct normally belongs to the commit that assembled it.
+   - `change: "add"` contains an entire new file, including an empty file. It has no blame candidates and its `target` stays unset. Use a user-specified owner or inspect earlier commits for evidence such as the import or feature that requires the missing file. Do not guess from the latest directory edit; ask only if ownership remains unclear.
+   - Keep assignments within the user's intended scope and after the base. Do not assign a whole modified file by its latest edit date, pick by majority alone, or rewrite upstream commits outside the boundary.
+
+5. Edit **only each hunk's `target`** in the plan, using a full commit SHA. The script validates the remaining plan. Targets must precede the original HEAD and follow the base. The default remains all-or-nothing: every hunk needs an eligible target. Only when the user explicitly permits a residual commit, leave uncertain or intentionally unabsorbed hunks at `target: null` and use `--keep-unassigned` on apply. Do not invent owners merely to clear ambiguity. At least one hunk must be assigned; all-null plans are rejected without a rewrite. Added files move whole to one owner, and their paths must be absent at that destination. If a changed block or added file genuinely contains unrelated fixes for multiple owners, the script cannot split it further: stop and explain that it needs a finer patch split. Independent changed blocks within the same modified file are already separate hunks.
+6. Give a short update with the number of destination commits and any residual hunks. An explicit user request to eliminate/absorb the commit authorizes the local rewrite; do not ask again. For a review-only request, stop after planning.
+7. Apply:
+
+   ```bash
+   python3 /absolute/skill/path/scripts/absorb.py apply --repo /absolute/repo --plan /tmp/absorb-plan.json
+   ```
+
+   For an explicitly authorized partial absorption, append `--keep-unassigned`. The script applies null-target patches last to a temporary index, checks the exact final tree, and creates one residual HEAD preserving the original HEAD message and author/committer metadata. It does not simply force the final tree to match. If no hunks remain, no residual commit is created. Signed commits that would need rewriting, including a residual HEAD, are rejected. The result includes `residual` (new SHA or null) and `residual_hunks`; the original HEAD maps to the residual SHA when one exists.
+
+   On a patch conflict, the script leaves the branch and working tree untouched. Inspect the reported commit and patch ownership. Correct a demonstrated attribution mistake and retry; do not use blanket ours/theirs resolutions or force the final tree into the last commit.
+8. Verify `git status --short`, `git diff --exit-code <backup-ref> HEAD`, and that the removed SHA is no longer an ancestor of HEAD. Report destination count, residual hunk count and SHA if present, new HEAD, and backup ref. A retained residual commit has a new SHA; the original HEAD must no longer be an ancestor. Verify protected branch refs remain unchanged and that the residual diff contains only the explicitly retained changes. The script writes an old-to-new mapping beside the plan. A history-only rewrite with an identical tree needs history verification; it introduces no new source behavior to test. Follow any explicitly required repository checks.
+
+Keep the backup ref. Do not push unless explicitly requested. Existing commit messages remain unchanged, even if today's repository conventions differ.

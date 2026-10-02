@@ -1,0 +1,4 @@
+interface:
+  display_name: "Absorb Commit into History"
+  short_description: "Fold commit hunks into their preceding owners"
+  default_prompt: "Use $git-absorb-commit to absorb this HEAD commit into its preceding owners, respecting any destinations I specify and preserving the final file tree."
