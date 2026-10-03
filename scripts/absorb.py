@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan and atomically absorb a HEAD commit into preceding linear history."""
+"""Absorb or move a HEAD commit while preserving the final tree."""
 import argparse
 import difflib
 import json
@@ -23,7 +23,7 @@ def sha(repo, ref):
     return git(repo, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
 
 
-def inspect(repo, commit, base):
+def inspect(repo, commit, base, allow_single=False):
     head = sha(repo, "HEAD")
     commit, base = sha(repo, commit), sha(repo, base)
     if commit != head:
@@ -35,7 +35,7 @@ def inspect(repo, commit, base):
     if git(repo, "rev-list", "--merges", base + ".." + head).strip():
         raise ValueError("Merge commits in the rewrite range are unsupported.")
     commits = git(repo, "rev-list", "--reverse", base + ".." + head).decode().splitlines()
-    if len(commits) < 2:
+    if len(commits) < (1 if allow_single else 2):
         raise ValueError("No preceding destination commits after the base.")
     eligible = set(commits[:-1])
     changes = git(repo, "diff", "--raw", "--no-abbrev", "--no-renames", "-z", head + "^", head).split(b"\0")
@@ -195,6 +195,49 @@ def apply(repo, planpath, keep_unassigned=False):
     print(json.dumps(report, indent=2))
 
 
+def move(repo, commit, after, base, out):
+    state, commits = inspect(repo, commit, base, allow_single=True)
+    head, after = state["head"], sha(repo, after)
+    if after != state["base"] and after not in commits[:-1]:
+        raise ValueError("The anchor must be the base or a preceding commit after it.")
+    if after == sha(repo, head + "^"):
+        report = {"head": head, "moved": head, "after": after, "backup": None,
+                  "mapping": {}, "changed": False}
+        out.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+        return
+    later = commits[commits.index(after) + 1:-1] if after in commits else commits[:-1]
+    order = [head] + later
+    raw = {c: git(repo, "cat-file", "commit", c) for c in order}
+    for c, value in raw.items():
+        if b"\ngpgsig" in value.split(b"\n\n", 1)[0]:
+            raise ValueError(f"Signed commit would lose its signature: {c}")
+    backup = "refs/backup/move-" + head[:12] + "-" + uuid.uuid4().hex[:8]
+    git(repo, "update-ref", backup, head, "0" * len(head))
+    mapping = {}
+    with tempfile.TemporaryDirectory(prefix="git-move-") as tmp:
+        env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
+        parent = after
+        git(repo, "read-tree", parent, env=env)
+        for current in order:
+            delta = git(repo, "diff", "--binary", "--no-ext-diff", current + "^", current)
+            if delta:
+                apply_patch_with_context(repo, delta, env,
+                                         "move-selected" if current == head else "replay-original", current)
+            tree = git(repo, "write-tree", env=env).decode().strip()
+            parent = create_commit(repo, raw[current], tree, parent, env)
+            mapping[current] = parent
+        if git(repo, "rev-parse", parent + "^{tree}") != git(repo, "rev-parse", head + "^{tree}"):
+            raise ValueError("Final tree differs; branch was not updated.")
+        if git(repo, "status", "--porcelain").strip() or git(repo, "symbolic-ref", "HEAD").decode().strip() != state["branch"]:
+            raise ValueError("Checkout changed during rewrite; branch was not updated.")
+        report = {"head": parent, "moved": mapping[head], "after": after, "backup": backup,
+                  "mapping": mapping, "changed": True}
+        out.write_text(json.dumps(report, indent=2) + "\n")
+        git(repo, "update-ref", "-m", "move commit after requested anchor", state["branch"], parent, head)
+    print(json.dumps(report, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -208,14 +251,22 @@ def main():
     p.add_argument("--plan", type=Path, required=True)
     p.add_argument("--keep-unassigned", action="store_true",
                    help="Keep null-target hunks in a final residual commit; at least one assigned hunk is required")
+    p = sub.add_parser("move", help="Move HEAD immediately after an earlier commit without absorbing it")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--commit", required=True)
+    p.add_argument("--after", required=True)
+    p.add_argument("--base", required=True)
+    p.add_argument("--out", type=Path, required=True, help="Write the JSON report outside the repository")
     args = parser.parse_args()
     try:
         if args.command == "plan":
             plan, _ = inspect(args.repo, args.commit, args.base)
             args.out.write_text(json.dumps(plan, indent=2) + "\n")
             print(f"Saved {len(plan['hunks'])} hunks to {args.out}; review every target before apply.")
-        else:
+        elif args.command == "apply":
             apply(args.repo, args.plan, keep_unassigned=args.keep_unassigned)
+        else:
+            move(args.repo, args.commit, args.after, args.base, args.out)
     except (ValueError, UnicodeError, OSError, KeyError) as error:
         parser.exit(1, f"Stopped: {error}\n")
 

@@ -1,6 +1,6 @@
 # git-absorb-commit
 
-An [Agent Skill](https://agentskills.io/specification) that folds a cleanup or fixup **HEAD commit** into the earlier commits that own its changes, without changing the final file tree.
+An [Agent Skill](https://agentskills.io/specification) that folds a cleanup or fixup **HEAD commit** into its earlier owners, or moves it beside a related commit, without changing the final file tree.
 
 Unlike assigning each file to its last editor, this skill reviews ownership at the changed-block level. It supports newly added text files and an explicitly requested residual commit for changes that cannot safely be assigned.
 
@@ -36,6 +36,10 @@ No package installation, API key, service, or network access is needed to run th
 For partial absorption:
 
 > Absorb only the changes with a clear owner. Keep the remaining changes in a final commit.
+
+For a related fix with later dependencies:
+
+> Move my latest fix immediately after the related commit. Fold corrections that depend on later features into their owners, and preserve the final tree.
 
 Read [SKILL.md](SKILL.md) for the complete ownership-review and verification workflow. A request to review a plan alone does not authorize a rewrite or a push.
 
@@ -73,6 +77,18 @@ At least one hunk must be assigned. An all-null plan is rejected without rewriti
 
 The JSON report includes the new `head`, a `backup` ref, destination count, old-to-new `mapping`, `residual` SHA (or null), and `residual_hunks`. A matching `.result.json` file is written beside the plan. Treat a nonzero exit as failure; a report file alone is not proof that the branch was updated.
 
+To move HEAD as a separate commit immediately after an earlier commit:
+
+```sh
+python3 "$SKILL/scripts/absorb.py" move \
+  --repo "$REPO" --commit HEAD --after <anchor-sha> --base "$BASE" \
+  --out /tmp/move-result.json
+```
+
+The move command preserves the order of intervening commits and checks exact final-tree equality before updating the branch. Its report distinguishes the relocated `moved` commit from the final `head`. An already adjacent commit is a successful no-op. A conflict or tree mismatch leaves the branch and checkout untouched.
+
+For a mixed fix, first absorb dependent corrections with `--keep-unassigned`, then move the returned residual using the current anchor from the old-to-new mapping. Read [Move a related fix](references/move-related-fix.md) for dependency review, combined test patches, and code adaptation when automatic replay is insufficient.
+
 ## Safety and limits
 
 - Uses a temporary index and updates only the current branch, with an expected-old-SHA check
@@ -95,7 +111,7 @@ Keep the backup ref until you have reviewed the rewritten history. Verify the fi
 python3 scripts/test_absorb.py
 ```
 
-The suite covers ownership splitting, added files, Unicode and quoted paths, metadata preservation, partial absorption, unassigned and ambiguous hunks, protected-base rejection, plan tampering, signed residual rejection, and conflict safety. Add an isolated regression test for behavior changes. Use synthetic repositories and redact private paths, commit data, logs, and credentials from reports.
+The suite covers ownership splitting, added files, Unicode and quoted paths, metadata preservation, partial absorption followed by relocation, adjacency, protected-base rejection, plan tampering, signatures, and branch/index/tree preservation on conflicts or final-tree mismatches. Add an isolated regression test for behavior changes. Use synthetic repositories and redact private paths, commit data, logs, and credentials from reports.
 
 ## License
 

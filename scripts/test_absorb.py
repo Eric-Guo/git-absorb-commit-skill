@@ -57,6 +57,21 @@ class AbsorbTest(unittest.TestCase):
         self.planpath.write_text(json.dumps(plan))
         return self.command("apply", "--repo", str(self.repo), "--plan", str(self.planpath), *options)
 
+    def move(self, after):
+        return self.command("move", "--repo", str(self.repo), "--commit", "HEAD", "--after", after,
+                            "--base", self.base, "--out", str(self.planpath.with_suffix(".result.json")))
+
+    def assert_move_rejected(self, after, message):
+        head = self.git("rev-parse", "HEAD")
+        index = self.git("ls-files", "--stage")
+        result = self.move(after)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(message, result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("ls-files", "--stage"), index)
+        self.assertEqual(self.git("status", "--porcelain"), b"")
+        self.assertFalse(self.planpath.with_suffix(".result.json").exists())
+
     def assert_rewrite(self, head, report):
         self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), self.git("rev-parse", head + "^{tree}"))
         self.assertEqual(self.git("rev-parse", report["backup"]).decode().strip(), head)
@@ -321,6 +336,106 @@ class AbsorbTest(unittest.TestCase):
         self.git("update-ref", "refs/heads/topic", head)
         plan = self.plan()
         self.assert_rejected(plan, "Signed commit would lose its signature", "--keep-unassigned")
+
+    def test_absorb_dependencies_then_move_residual_after_related_commit(self):
+        self.write("directory.txt", "always create\n")
+        related = self.commit("feat: create directory")
+        self.git("branch", "related", related)
+        self.git("branch", "v2", self.base)
+        self.write("api.txt", "missing error\n")
+        feature = self.commit("feat: add API")
+        self.write("notes.txt", "unrelated\n")
+        self.commit("docs: notes")
+        self.write("directory.txt", "create for first session\n")
+        self.write("api.txt", "return missing error\n")
+        original = self.commit("fix: directory and API")
+        plan = self.plan()
+        for hunk in plan["hunks"]:
+            hunk["target"] = feature if hunk["file"] == "api.txt" else None
+        absorbed = self.apply(plan, "--keep-unassigned")
+        self.assertEqual(absorbed.returncode, 0, absorbed.stderr)
+        absorbed = json.loads(absorbed.stdout)
+        self.assert_rewrite(original, absorbed)
+        residual = absorbed["residual"]
+        result = self.move(related)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assert_rewrite(residual, report)
+        self.assertEqual(self.git("rev-parse", report["moved"] + "^").decode().strip(), related)
+        self.assertEqual(report["after"], related)
+        self.assertTrue(report["changed"])
+        rewritten_feature = report["mapping"][absorbed["mapping"][feature]]
+        self.assertEqual(self.git("show", rewritten_feature + ":api.txt"), b"return missing error\n")
+        self.assertEqual(self.git("diff", "--name-only", report["moved"] + "^", report["moved"]),
+                         b"directory.txt\n")
+        self.assertEqual(self.git("rev-parse", "related").decode().strip(), related)
+        self.assertEqual(self.git("rev-parse", "v2").decode().strip(), self.base)
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), self.git("rev-parse", original + "^{tree}"))
+
+    def test_move_directly_after_base(self):
+        self.write("notes.txt", "unrelated\n")
+        self.commit("docs: notes")
+        self.write("base.txt", "corrected\n")
+        original = self.commit("fix: base")
+        result = self.move(self.base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assert_rewrite(original, report)
+        self.assertEqual(self.git("rev-parse", report["moved"] + "^").decode().strip(), self.base)
+        self.assertEqual(self.git("show", report["moved"] + ":base.txt"), b"corrected\n")
+
+    def test_move_already_after_anchor_does_not_rewrite(self):
+        self.write("base.txt", "corrected\n")
+        self.commit("fix: base")
+        before = self.git("rev-parse", "HEAD")
+        backups = self.git("for-each-ref", "refs/backup")
+        result = self.move(self.base)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        repeated = json.loads(result.stdout)
+        self.assertFalse(repeated["changed"])
+        self.assertIsNone(repeated["backup"])
+        self.assertEqual(repeated["mapping"], {})
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(self.git("for-each-ref", "refs/backup"), backups)
+
+    def test_move_missing_dependency_keeps_branch_index_and_tree_untouched(self):
+        self.write("related.txt", "related\n")
+        related = self.commit("feat: related")
+        self.write("api.txt", "later feature\n")
+        self.commit("feat: API")
+        self.write("api.txt", "corrected feature\n")
+        original = self.commit("fix: API")
+        self.assert_move_rejected(related, "phase=move-selected, commit=" + original)
+
+    def test_move_rejects_replay_that_would_change_final_tree(self):
+        self.write("shared.txt", "original\n")
+        related = self.commit("feat: related")
+        self.write("shared.txt", "later\n")
+        self.commit("feat: later")
+        self.write("shared.txt", "original\n")
+        self.commit("fix: restore original")
+        self.assert_move_rejected(related, "Final tree differs; branch was not updated")
+
+    def test_move_rejects_anchor_outside_boundary(self):
+        self.write("later.txt", "later\n")
+        self.commit("feat: later")
+        self.write("base.txt", "corrected\n")
+        original = self.commit("fix: base")
+        self.assert_move_rejected(original, "The anchor must be the base or a preceding commit after it")
+
+    def test_move_rejects_signed_commit_in_replay(self):
+        self.write("related.txt", "related\n")
+        related = self.commit("feat: related")
+        self.write("later.txt", "later\n")
+        self.commit("feat: later")
+        headers, message = self.git("cat-file", "commit", "HEAD").split(b"\n\n", 1)
+        signed = subprocess.check_output(
+            ["git", "-C", str(self.repo), "hash-object", "-w", "-t", "commit", "--stdin"],
+            input=headers + b"\ngpgsig placeholder\n\n" + message, env=self.env).decode().strip()
+        self.git("update-ref", "refs/heads/topic", signed)
+        self.write("related.txt", "corrected\n")
+        self.commit("fix: related")
+        self.assert_move_rejected(related, "Signed commit would lose its signature: " + signed)
 
     def test_inherited_git_environment_cannot_target_another_repository(self):
         sentinel = self.root / "sentinel"
