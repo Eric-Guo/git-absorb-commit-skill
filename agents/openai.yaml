@@ -1,4 +1,4 @@
 interface:
   display_name: "Absorb or Move a Related Fix"
   short_description: "Fold fixes into owners or move them beside related commits"
-  default_prompt: "Use $git-absorb-commit to absorb this HEAD fix into its owners or move it after the commit I specify, preserving the final file tree."
+  default_prompt: "Use $git-absorb-commit to absorb this fix (HEAD or an ancestor) into its owners or move it after the commit I specify, preserving the final file tree."

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Absorb or move a HEAD commit while preserving the final tree."""
+"""Absorb an ancestor commit or move a HEAD commit while preserving the final tree."""
 import argparse
 import difflib
 import json
@@ -23,22 +23,23 @@ def sha(repo, ref):
     return git(repo, "rev-parse", "--verify", ref + "^{commit}").decode().strip()
 
 
-def inspect(repo, commit, base, allow_single=False):
+def inspect(repo, commit, base, allow_single=False, allow_older=True):
     head = sha(repo, "HEAD")
     commit, base = sha(repo, commit), sha(repo, base)
-    if commit != head:
+    if not allow_older and commit != head:
         raise ValueError("Only a HEAD commit is supported.")
     if git(repo, "status", "--porcelain").strip():
         raise ValueError("Working tree must be clean, including untracked files.")
     branch = git(repo, "symbolic-ref", "HEAD").decode().strip()
     git(repo, "merge-base", "--is-ancestor", base, commit)
+    git(repo, "merge-base", "--is-ancestor", commit, head)
     if git(repo, "rev-list", "--merges", base + ".." + head).strip():
         raise ValueError("Merge commits in the rewrite range are unsupported.")
     commits = git(repo, "rev-list", "--reverse", base + ".." + head).decode().splitlines()
-    if len(commits) < (1 if allow_single else 2):
+    if commit not in commits or (not allow_single and commits.index(commit) < 1):
         raise ValueError("No preceding destination commits after the base.")
-    eligible = set(commits[:-1])
-    changes = git(repo, "diff", "--raw", "--no-abbrev", "--no-renames", "-z", head + "^", head).split(b"\0")
+    eligible = set(commits[:commits.index(commit)])
+    changes = git(repo, "diff", "--raw", "--no-abbrev", "--no-renames", "-z", commit + "^", commit).split(b"\0")
     hunks = []
     for i in range(0, len(changes) - 1, 2):
         info, path = changes[i].decode(), changes[i + 1].decode()
@@ -47,8 +48,8 @@ def inspect(repo, commit, base, allow_single=False):
             raise ValueError(f"Only added or modified regular text files are supported: {path}")
         if status == "M" and oldmode[1:] != newmode:
             raise ValueError(f"Mode changes are unsupported: {path}")
-        before = b"" if status == "A" else git(repo, "show", head + "^:" + path)
-        after = git(repo, "show", head + ":" + path)
+        before = b"" if status == "A" else git(repo, "show", commit + "^:" + path)
+        after = git(repo, "show", commit + ":" + path)
         if b"\0" in before + after:
             raise ValueError(f"Binary file unsupported: {path}")
         old, new = before.decode().splitlines(keepends=True), after.decode().splitlines(keepends=True)
@@ -65,7 +66,7 @@ def inspect(repo, commit, base, allow_single=False):
             start, end = (a + 1, b) if a < b else (max(1, a), min(len(old), a + 1))
             counts = {}
             if old:
-                blame = git(repo, "blame", "--line-porcelain", "-L", f"{start},{end}", head + "^", "--", path).decode()
+                blame = git(repo, "blame", "--line-porcelain", "-L", f"{start},{end}", commit + "^", "--", path).decode()
                 for owner in re.findall(r"^([0-9a-f]{40,64}) \d+ \d+(?: \d+)?$", blame, re.M):
                     counts[owner] = counts.get(owner, 0) + 1
             candidates = [{"commit": owner, "lines": count, "eligible": owner in eligible,
@@ -77,7 +78,7 @@ def inspect(repo, commit, base, allow_single=False):
                           "target": owners[0] if len(owners) == 1 else None})
     if not hunks:
         raise ValueError("No text changes to absorb.")
-    return {"head": head, "base": base, "branch": branch, "hunks": hunks}, commits
+    return {"head": head, "commit": commit, "base": base, "branch": branch, "hunks": hunks}, commits
 
 
 def patch(repo, head, path, hunks):
@@ -133,12 +134,14 @@ def create_commit(repo, raw_commit, tree, parent, env):
 
 def apply(repo, planpath, keep_unassigned=False):
     plan = json.loads(planpath.read_text())
-    fresh, commits = inspect(repo, plan["head"], plan["base"])
+    fresh, commits = inspect(repo, plan["commit"], plan["base"])
+    cleanup = plan["commit"]
+    eligible = commits[:commits.index(cleanup)]
     if len(plan["hunks"]) != len(fresh["hunks"]):
         raise ValueError("Plan hunks changed; regenerate it.")
     for supplied, expected in zip(plan["hunks"], fresh["hunks"]):
         target = supplied.get("target")
-        if target not in commits[:-1] and not (keep_unassigned and target is None):
+        if target not in eligible and not (keep_unassigned and target is None):
             raise ValueError(f"Hunk {expected['id']} needs a full eligible target SHA.")
         expected["target"] = target
     if plan != fresh:
@@ -151,9 +154,9 @@ def apply(repo, planpath, keep_unassigned=False):
     if not targets:
         raise ValueError("No assigned hunks to absorb; branch was not updated.")
     earliest = min(commits.index(c) for c in targets)
-    rewrite = commits[earliest:-1]
+    rewrite = [c for c in commits[earliest:] if c != cleanup]
     raw = {c: git(repo, "cat-file", "commit", c)
-           for c in rewrite + ([plan["head"]] if residual else [])}
+           for c in rewrite + ([cleanup] if residual else [])}
     for c, value in raw.items():
         if b"\ngpgsig" in value.split(b"\n\n", 1)[0]:
             raise ValueError(f"Signed commit would lose its signature: {c}")
@@ -164,39 +167,42 @@ def apply(repo, planpath, keep_unassigned=False):
         env = dict(os.environ, GIT_INDEX_FILE=str(Path(tmp) / "index"))
         parent = sha(repo, rewrite[0] + "^")
         git(repo, "read-tree", parent, env=env)
-        for commit in rewrite:
+        for commit in commits[earliest:]:
+            if commit == cleanup:
+                if residual:
+                    for path in sorted({h["file"] for h in residual}):
+                        delta = patch(repo, cleanup, path, [h for h in residual if h["file"] == path])
+                        apply_patch_with_context(repo, delta, env, "retain-residual", cleanup,
+                                                 [h for h in residual if h["file"] == path], path)
+                    tree = git(repo, "write-tree", env=env).decode().strip()
+                    parent = create_commit(repo, raw[cleanup], tree, parent, env)
+                    mapping[cleanup] = parent
+                continue
             original = git(repo, "diff", "--binary", "--no-ext-diff", commit + "^", commit)
             if original:
                 apply_patch_with_context(repo, original, env, "replay-original", commit)
             selected = [h for h in plan["hunks"] if h["target"] == commit]
             for path in sorted({h["file"] for h in selected}):
-                delta = patch(repo, plan["head"], path, [h for h in selected if h["file"] == path])
+                delta = patch(repo, cleanup, path, [h for h in selected if h["file"] == path])
                 apply_patch_with_context(repo, delta, env, "absorb-selected", commit,
                                          [h for h in selected if h["file"] == path], path)
             tree = git(repo, "write-tree", env=env).decode().strip()
             parent = create_commit(repo, raw[commit], tree, parent, env)
             mapping[commit] = parent
-        if residual:
-            for path in sorted({h["file"] for h in residual}):
-                delta = patch(repo, plan["head"], path, [h for h in residual if h["file"] == path])
-                apply_patch_with_context(repo, delta, env, "retain-residual", plan["head"],
-                                         [h for h in residual if h["file"] == path], path)
-            tree = git(repo, "write-tree", env=env).decode().strip()
-            parent = create_commit(repo, raw[plan["head"]], tree, parent, env)
-            mapping[plan["head"]] = parent
         if git(repo, "rev-parse", parent + "^{tree}") != git(repo, "rev-parse", plan["head"] + "^{tree}"):
             raise ValueError("Final tree differs; branch was not updated.")
         if git(repo, "status", "--porcelain").strip() or git(repo, "symbolic-ref", "HEAD").decode().strip() != plan["branch"]:
             raise ValueError("Checkout changed during rewrite; branch was not updated.")
         report = {"head": parent, "backup": backup, "destinations": len(targets), "mapping": mapping,
-                  "residual": parent if residual else None, "residual_hunks": len(residual)}
+                  "residual": mapping.get(cleanup), "residual_hunks": len(residual),
+                  "absorbed": cleanup, "replayed_descendants": len(commits) - commits.index(cleanup) - 1}
         planpath.with_suffix(".result.json").write_text(json.dumps(report, indent=2) + "\n")
         git(repo, "update-ref", "-m", "absorb commit into preceding owners", plan["branch"], parent, plan["head"])
     print(json.dumps(report, indent=2))
 
 
 def move(repo, commit, after, base, out):
-    state, commits = inspect(repo, commit, base, allow_single=True)
+    state, commits = inspect(repo, commit, base, allow_single=True, allow_older=False)
     head, after = state["head"], sha(repo, after)
     if after != state["base"] and after not in commits[:-1]:
         raise ValueError("The anchor must be the base or a preceding commit after it.")

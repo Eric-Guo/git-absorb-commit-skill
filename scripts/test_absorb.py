@@ -95,6 +95,60 @@ class AbsorbTest(unittest.TestCase):
         self.assertEqual(self.git("status", "--porcelain"), b"")
         self.assertFalse(self.planpath.with_suffix(".result.json").exists())
 
+    def older_fixture(self):
+        self.write("shared.txt", "draft\n")
+        owner = self.commit("owner")
+        self.write("shared.txt", "fixed\n")
+        self.write("residual.txt", "initial\n")
+        cleanup = self.commit("cleanup")
+        self.write("shared.txt", "fixed\ndescendant\n")
+        self.write("residual.txt", "updated\n")
+        later = self.commit("descendant")
+        self.git("branch", "v2", self.base)
+        result = self.command("plan", "--repo", str(self.repo), "--commit", cleanup,
+                              "--base", self.base, "--out", str(self.planpath))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return owner, cleanup, later, json.loads(self.planpath.read_text())
+
+    def test_older_absorption_replays_dependent_descendant(self):
+        owner, cleanup, head, plan = self.older_fixture()
+        for hunk in plan["hunks"]:
+            hunk["target"] = owner
+        result = self.apply(plan)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assert_rewrite(head, report)
+        self.assertEqual(report["replayed_descendants"], 1)
+        self.assertIsNone(report["residual"])
+        self.assertNotIn(cleanup, self.git("rev-list", "HEAD").decode().splitlines())
+        self.assertEqual(self.git("rev-parse", "v2").decode().strip(), self.base)
+        self.assertEqual(self.git("show", report["mapping"][owner] + ":shared.txt"), b"fixed\n")
+
+    def test_older_residual_stays_before_dependent_descendant(self):
+        _, cleanup, head, plan = self.older_fixture()
+        result = self.apply(plan, "--keep-unassigned")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assert_rewrite(head, report)
+        self.assertEqual(report["residual"], report["mapping"][cleanup])
+        self.assertEqual(self.git("rev-parse", "HEAD^").decode().strip(), report["residual"])
+        self.assertEqual(self.git("diff", "--name-only", report["residual"] + "^", report["residual"]),
+                         b"residual.txt\n")
+
+    def test_older_cannot_absorb_into_descendant(self):
+        _, _, head, plan = self.older_fixture()
+        for hunk in plan["hunks"]:
+            hunk["target"] = head
+        self.assert_rejected(plan, "needs a full eligible target SHA")
+
+    def test_older_stale_plan_keeps_branch_untouched(self):
+        owner, _, _, plan = self.older_fixture()
+        for hunk in plan["hunks"]:
+            hunk["target"] = owner
+        self.write("extra.txt", "new head\n")
+        self.commit("extra")
+        self.assert_rejected(plan, "Only hunk target fields may be edited")
+
     def test_new_files_join_owner_and_preserve_later_patch(self):
         self.write("watcher.py", "from ignore import patterns\n")
         owner = self.commit("feat: watch directories")

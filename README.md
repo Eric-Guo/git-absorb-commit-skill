@@ -1,6 +1,6 @@
 # git-absorb-commit
 
-An [Agent Skill](https://agentskills.io/specification) that folds a cleanup or fixup **HEAD commit** into its earlier owners, or moves it beside a related commit, without changing the final file tree.
+An [Agent Skill](https://agentskills.io/specification) that folds a cleanup or fixup **commit on the current branch** into its earlier owners, or moves it beside a related commit, without changing the final file tree.
 
 Unlike assigning each file to its last editor, this skill reviews ownership at the changed-block level. It supports newly added text files and an explicitly requested residual commit for changes that cannot safely be assigned.
 
@@ -73,9 +73,11 @@ python3 "$SKILL/scripts/absorb.py" apply \
   --repo "$REPO" --plan /tmp/absorb-plan.json --keep-unassigned
 ```
 
-At least one hunk must be assigned. An all-null plan is rejected without rewriting. No extra commit is created when no residual hunks remain. Otherwise, the residual HEAD retains the original HEAD's message and author/committer metadata.
+At least one hunk must be assigned. An all-null plan is rejected without rewriting. No extra commit is created when no residual hunks remain. Otherwise, the residual commit retains the selected commit's message and author/committer metadata.
 
-The JSON report includes the new `head`, a `backup` ref, destination count, old-to-new `mapping`, `residual` SHA (or null), and `residual_hunks`. A matching `.result.json` file is written beside the plan. Treat a nonzero exit as failure; a report file alone is not proof that the branch was updated.
+For an older fix, pass its SHA to `plan --commit`. Destinations must precede it; descendants replay in order. A residual stays at the fix’s original position before descendants. The plan records both the original checkout `head` and selected `commit`; the backup protects the original checkout HEAD. Moving remains HEAD-only.
+
+The JSON report includes `absorbed` and `replayed_descendants` as well as the new `head`, a `backup` ref, destination count, old-to-new `mapping`, `residual` SHA (or null), and `residual_hunks`. A matching `.result.json` file is written beside the plan. Treat a nonzero exit as failure; a report file alone is not proof that the branch was updated.
 
 To move HEAD as a separate commit immediately after an earlier commit:
 
@@ -98,7 +100,7 @@ For a mixed fix, first absorb dependent corrections with `--keep-unassigned`, th
 - A failed patch leaves the branch, working tree, and live index unchanged, but may leave a backup ref and unreachable Git objects
 - Rewriting changes commit IDs; coordinate before rewriting history already shared with others
 - The base boundary must be correct: the script does not infer which other branch refs you consider protected
-- Supports nonempty HEAD commits containing added or modified UTF-8 regular text files; nonempty files must end in a newline
+- Supports nonempty HEAD or ancestor commits containing added or modified UTF-8 regular text files; nonempty files must end in a newline
 - Rejects merges in the rewrite range, deletions, renames, existing-file mode changes, and signatures that would be lost by rewriting
 - Cannot split one changed block or one added file between multiple owners; retain it or prepare a finer split separately
 - A partial plan can still conflict; inspect the reported commit, phase, file, and hunk IDs instead of forcing a resolution
